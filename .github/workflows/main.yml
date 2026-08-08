@@ -18,11 +18,11 @@ jobs:
 
       - name: 编译 KPM
         run: |
-          # 提取 NDK 绝对路径
-          NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}
+          # 严格按照官方文档，导出 NDK_PATH 环境变量
+          export NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}
           
-          # 强制把路径传递给 Makefile 里可能用到的所有变量名
-          make NDK=$NDK_PATH NDK_HOME=$NDK_PATH NDKROOT=$NDK_PATH ANDROID_NDK_HOME=$NDK_PATH
+          # 执行 make，并强制传入 NDK_PATH
+          make NDK_PATH=$NDK_PATH
 
       - name: 打包并上传成品
         uses: actions/upload-artifact@v4
