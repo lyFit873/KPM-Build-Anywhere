@@ -90,7 +90,6 @@ static void *(*p_vmalloc)(unsigned long size) = NULL;
 static void (*p_vfree)(const void *addr) = NULL;
 static unsigned long (*p__copy_to_user)(void *to, const void *from, unsigned long n) = NULL;
 static void *(*p_memcpy)(void *dest, const void *src, size_t n) = NULL;
-static void *(*p_memset)(void *s, int c, size_t n) = NULL;
 
 // ==========================================
 // 3. 核心业务逻辑与状态机
@@ -130,7 +129,6 @@ static int32_t lookup_buf_handle(uint32_t iova) {
 
 // 状态控制
 static volatile int capture_status = 0; // 0:空闲, 1:等待抓取, 2:抓取完成
-static volatile int tamper_enabled = 0;
 static bool hooks_installed = false;
 static void *cached_frame = NULL;
 static size_t cached_size = 0;
@@ -172,7 +170,8 @@ static int pre_vfe_out_done(struct kprobe *p, struct pt_regs *regs) {
     uintptr_t vaddr = 0; size_t len = 0;
     u64 *x = (u64 *)regs;
 
-    if ((capture_status == 0 && !tamper_enabled) || !p_cam_mem_get_cpu_buf) return 0;
+    // 如果不在抓取状态，直接放行，零性能损耗
+    if (capture_status == 0 || !p_cam_mem_get_cpu_buf) return 0;
 
     evt = (struct cam_isp_hw_done_event_data *)x[1]; 
     if (!evt || evt->num_handles == 0 || evt->num_handles > CAM_NUM_OUT_PER_COMP_IRQ_MAX) return 0;
@@ -181,16 +180,6 @@ static int pre_vfe_out_done(struct kprobe *p, struct pt_regs *regs) {
     buf_handle = lookup_buf_handle(iova);
 
     if (buf_handle != 0 && p_cam_mem_get_cpu_buf(buf_handle, &vaddr, &len) == 0 && vaddr != 0) {
-        
-        // [修改画面]
-        if (tamper_enabled && p_memset) {
-            size_t wipe_offset = len / 3;
-            size_t wipe_size = len / 16;
-            if (wipe_offset + wipe_size <= len) {
-                p_memset((void *)(vaddr + wipe_offset), 0x00, wipe_size);
-            }
-        }
-
         // [截获画面]
         if (capture_status == 1 && cached_frame && p_memcpy) {
             size_t copy_len = len > MAX_FRAME_SIZE ? MAX_FRAME_SIZE : len;
@@ -223,7 +212,6 @@ KPM_CTL0(cam_kpm_control0) {
         p_vfree = (void *)kallsyms_lookup_name("vfree");
         p__copy_to_user = (void *)kallsyms_lookup_name("_copy_to_user");
         p_memcpy = (void *)kallsyms_lookup_name("memcpy");
-        p_memset = (void *)kallsyms_lookup_name("memset");
 
         if (!p_cam_mem_get_cpu_buf || !p_vmalloc || !p__copy_to_user) return -1;
 
@@ -234,14 +222,12 @@ KPM_CTL0(cam_kpm_control0) {
         hooks_installed = true;
         return 0;
     }
+    // 请求抓取
     else if (cmd == 'c' && hooks_installed) {
         capture_status = 1;
         return 0;
     }
-    else if (cmd == 't' && hooks_installed) {
-        tamper_enabled = !tamper_enabled;
-        return 0;
-    }
+    // 读取画面 (由用户态传入内存地址)
     else if (cmd == 'r' && hooks_installed) {
         if (capture_status != 2) return -11; 
 
