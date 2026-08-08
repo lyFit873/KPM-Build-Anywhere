@@ -8,18 +8,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 获取源代码
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # 这里改成了 v4
 
       - name: 配置 Android NDK 环境
         uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
-          ndk-version: r25c # 使用最稳定的 NDK 版本
+          ndk-version: r25c
 
       - name: 编译 KPM
         run: |
           export NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}
-          # 赋予构建脚本执行权限并执行（兼容常见模板）
           if [ -f "build.sh" ]; then
             chmod +x build.sh
             ./build.sh
@@ -28,7 +27,7 @@ jobs:
           fi
 
       - name: 打包并上传成品
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4  # 这里也改成了 v4
         with:
           name: KPM-Output
           path: |
