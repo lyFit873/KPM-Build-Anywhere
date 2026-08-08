@@ -1,17 +1,70 @@
-#include <linux/module.h>
-#include <linux/kprobes.h>
+#include <linux/types.h>
+#include <linux/list.h>
+#include <linux/spinlock.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
-#include <linux/spinlock.h>
-// 假设你的 KPM 模板提供了这些头文件
-// #include "kputils.h" 
-// #include "common.h"
+
+// 引入 KPM 模板核心头文件
+#include "kputils.h"
+#include "common.h"
 
 // ==========================================
-// 1. 高通 Camera 数据结构定义 (根据交接文档还原)
+// 1. 暴力手搓 kprobes 结构体 (绕过残缺头文件限制)
+// ==========================================
+typedef u32 kprobe_opcode_t;
+struct kprobe;
+struct pt_regs;
+typedef int (*kprobe_pre_handler_t) (struct kprobe *, struct pt_regs *);
+typedef void (*kprobe_post_handler_t) (struct kprobe *, struct pt_regs *, unsigned long flags);
+typedef int (*kprobe_fault_handler_t) (struct kprobe *, struct pt_regs *, int trapnr);
+
+struct kprobe {
+    struct hlist_node hlist;
+    struct list_head list;
+    unsigned long nmissed;
+    phys_addr_t addr;
+    const char *symbol_name;
+    unsigned int offset;
+    kprobe_pre_handler_t pre_handler;
+    kprobe_post_handler_t post_handler;
+    kprobe_fault_handler_t fault_handler;
+    kprobe_opcode_t opcode;
+};
+
+struct kretprobe_instance;
+struct kretprobe;
+typedef int (*kretprobe_handler_t) (struct kretprobe_instance *, struct pt_regs *);
+
+struct kretprobe {
+    struct kprobe kp;
+    kretprobe_handler_t handler;
+    kretprobe_handler_t entry_handler;
+    int maxactive;
+    int nmissed;
+    size_t data_size;
+    struct hlist_head free_instances;
+    raw_spinlock_t lock;
+};
+
+struct kretprobe_instance {
+    struct hlist_node hlist;
+    struct kretprobe *rp;
+    kprobe_opcode_t *ret_addr;
+    void *task;
+    char data[0];
+};
+
+// 声明内核导出的 API
+extern int register_kprobe(struct kprobe *p);
+extern void unregister_kprobe(struct kprobe *p);
+extern int register_kretprobe(struct kretprobe *rp);
+extern void unregister_kretprobe(struct kretprobe *rp);
+
+// ==========================================
+// 2. 高通 Camera 数据结构定义
 // ==========================================
 #define CAM_NUM_OUT_PER_COMP_IRQ_MAX 6
 
@@ -23,7 +76,7 @@ struct cam_isp_hw_done_event_data {
 };
 
 // ==========================================
-// 2. IOVA <-> buf_handle 映射表 (Hook A 维护)
+// 3. IOVA <-> buf_handle 映射表 (Hook A 维护)
 // ==========================================
 #define MAX_MAP_ENTRIES 256
 struct iova_map_entry {
@@ -46,7 +99,6 @@ static int32_t lookup_buf_handle(uint32_t iova) {
     int i;
     int32_t handle = 0;
     spin_lock(&map_lock);
-    // 逆序查找，确保拿到最新绑定的 buffer
     for (i = 0; i < MAX_MAP_ENTRIES; i++) {
         int idx = (map_idx - 1 - i + MAX_MAP_ENTRIES) % MAX_MAP_ENTRIES;
         if (iova_map[idx].iova == iova) {
@@ -59,9 +111,8 @@ static int32_t lookup_buf_handle(uint32_t iova) {
 }
 
 // ==========================================
-// 3. 用户态数据交互通道 (Misc Device)
+// 4. 用户态数据交互通道 (Misc Device)
 // ==========================================
-// (复用之前我们讨论好的 frame_queue 和 Waitqueue 逻辑)
 struct frame_node {
     struct list_head list;
     void *data;
@@ -71,7 +122,10 @@ struct frame_node {
 static LIST_HEAD(frame_queue);
 static DEFINE_SPINLOCK(queue_lock);
 static DECLARE_WAIT_QUEUE_HEAD(cam_wait_queue);
+
 static bool capture_enabled = false;
+static bool tamper_enabled = false;
+static bool hooks_installed = false;
 
 static ssize_t cam_dump_read(struct file *file, char __user *buf, size_t count, loff_t *ppos) {
     struct frame_node *node = NULL;
@@ -102,29 +156,26 @@ static const struct file_operations cam_dump_fops = { .owner = THIS_MODULE, .rea
 static struct miscdevice cam_dump_dev = { .minor = MISC_DYNAMIC_MINOR, .name = "cam_raw_dump", .fops = &cam_dump_fops, .mode = 0666 };
 
 // ==========================================
-// 4. 函数指针与 Hook 定义
+// 5. 函数指针与 Hook 定义
 // ==========================================
-// 导出函数的指针
 static int (*p_cam_mem_get_cpu_buf)(int32_t buf_handle, uintptr_t *vaddr_ptr, size_t *len) = NULL;
 
-// Hook A: cam_mem_get_io_buf (Kretprobe)
+// Hook A 传递结构
 struct hook_a_data { int32_t buf_handle; dma_addr_t *iova_ptr; };
 
 static int entry_cam_mem_get_io_buf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct hook_a_data *data = (struct hook_a_data *)ri->data;
-    data->buf_handle = (int32_t)regs->regs[0];
-    data->iova_ptr = (dma_addr_t *)regs->regs[2];
+    u64 *x = (u64 *)regs; 
+    data->buf_handle = (int32_t)x[0];
+    data->iova_ptr = (dma_addr_t *)x[2];
     return 0;
 }
 
 static int ret_cam_mem_get_io_buf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct hook_a_data *data = (struct hook_a_data *)ri->data;
     dma_addr_t iova = 0;
-    
-    // 从指针中读取高通驱动分配的真实 IOVA (使用 copy_from_kernel_nofault 防止崩溃)
     if (data->iova_ptr) {
         copy_from_kernel_nofault(&iova, data->iova_ptr, sizeof(iova));
-        // 取低32位记录 (因为 last_consumed_addr 是 uint32_t)
         record_iova_mapping((uint32_t)iova, data->buf_handle);
     }
     return 0;
@@ -138,51 +189,58 @@ static struct kretprobe krp_get_io_buf = {
     .kp.symbol_name = "cam_mem_get_io_buf",
 };
 
-// Hook B: cam_vfe_bus_ver3_handle_vfe_out_done_bottom_half (Kprobe)
 static int pre_vfe_out_done(struct kprobe *p, struct pt_regs *regs) {
     struct cam_isp_hw_done_event_data *evt;
     uint32_t iova, buf_handle;
     uintptr_t vaddr = 0;
     size_t len = 0;
     struct frame_node *new_node;
+    u64 *x = (u64 *)regs;
 
-    if (!capture_enabled || !p_cam_mem_get_cpu_buf) return 0;
+    if ((!capture_enabled && !tamper_enabled) || !p_cam_mem_get_cpu_buf) return 0;
 
-    evt = (struct cam_isp_hw_done_event_data *)regs->regs[1]; // 参数2: evt_payload_priv
+    evt = (struct cam_isp_hw_done_event_data *)x[1]; 
     if (!evt || evt->num_handles == 0 || evt->num_handles > CAM_NUM_OUT_PER_COMP_IRQ_MAX) return 0;
 
-    // 这里我们只取第一个 handle，通常 RDI (Raw Dump) 会在其中
     iova = evt->last_consumed_addr[0];
     buf_handle = lookup_buf_handle(iova);
 
     if (buf_handle != 0) {
         if (p_cam_mem_get_cpu_buf(buf_handle, &vaddr, &len) == 0 && vaddr != 0) {
-            // 成功拿到虚拟地址，拷贝数据放入队列
-            new_node = kmalloc(sizeof(*new_node), GFP_ATOMIC);
-            if (new_node) {
-                new_node->data = vmalloc(len);
-                if (new_node->data) {
-                    memcpy(new_node->data, (void *)vaddr, len);
-                    new_node->size = len;
-                    new_node->read_offset = 0;
-
-                    spin_lock(&queue_lock);
-                    list_add_tail(&new_node->list, &frame_queue);
-                    spin_unlock(&queue_lock);
-                    wake_up_interruptible(&cam_wait_queue);
-                    
-                    // 抓到一帧后自动关闭，防止内存瞬间被海量高帧率 RAW 撑爆
-                    capture_enabled = false; 
-                } else {
-                    kfree(new_node);
+            
+            // [功能：篡改画面]
+            if (tamper_enabled) {
+                size_t wipe_offset = len / 3;
+                size_t wipe_size = len / 16;
+                if (wipe_offset + wipe_size <= len) {
+                    memset((void *)(vaddr + wipe_offset), 0x00, wipe_size);
                 }
             }
-        } else {
-            // 如果走到这里，说明交接文档里提到的 CAM_MEM_FLAG_KMD_ACCESS 标志位缺失问题真的发生了！
-            pr_err("[KPM] cam_mem_get_cpu_buf 拒绝访问 handle 0x%x\n", buf_handle);
+
+            // [功能：抓取画面]
+            if (capture_enabled) {
+                new_node = kmalloc(sizeof(*new_node), GFP_ATOMIC);
+                if (new_node) {
+                    new_node->data = vmalloc(len);
+                    if (new_node->data) {
+                        memcpy(new_node->data, (void *)vaddr, len);
+                        new_node->size = len;
+                        new_node->read_offset = 0;
+
+                        spin_lock(&queue_lock);
+                        list_add_tail(&new_node->list, &frame_queue);
+                        spin_unlock(&queue_lock);
+                        wake_up_interruptible(&cam_wait_queue);
+                        
+                        capture_enabled = false; 
+                    } else {
+                        kfree(new_node);
+                    }
+                }
+            }
         }
     }
-    return 0; // 允许原函数继续执行
+    return 0; 
 }
 
 static struct kprobe kp_vfe_out_done = {
@@ -190,43 +248,36 @@ static struct kprobe kp_vfe_out_done = {
     .pre_handler = pre_vfe_out_done,
 };
 
-static bool hooks_installed = false;
-
 // ==========================================
-// 5. KPM 模板接口实现
+// 6. KPM 接口定义
 // ==========================================
 
 KPM_INIT(cam_kpm_init) {
-    pr_info("[KPM] OnePlus 相机截获模块已加载。等待 CTL0 指令注入 Hook...\n");
+    pr_info("[KPM] OnePlus Camera dump&tamper loaded.\n");
     misc_register(&cam_dump_dev);
-    return 0; // 不在这里挂钩，避免找不到符号
+    return 0; 
 }
 
-// 通过向 /sys/kpm/ctl0 写入指令交互 (KPM 框架自动提供)
 KPM_CTL0(cam_kpm_control0) {
     char cmd[16];
     if (copy_from_user(cmd, arg, sizeof(cmd))) return -EFAULT;
 
     if (cmd[0] == '1' && !hooks_installed) {
-        // 动态解析导出函数
         p_cam_mem_get_cpu_buf = (void *)kallsyms_lookup_name("cam_mem_get_cpu_buf");
-        if (!p_cam_mem_get_cpu_buf) {
-            pr_err("[KPM] 致命错误: 找不到 cam_mem_get_cpu_buf\n");
-            return -EINVAL;
-        }
+        if (!p_cam_mem_get_cpu_buf) return -EINVAL;
 
-        if (register_kretprobe(&krp_get_io_buf) < 0) pr_err("[KPM] Hook A 挂载失败\n");
-        if (register_kprobe(&kp_vfe_out_done) < 0) pr_err("[KPM] Hook B 挂载失败\n");
-        
+        register_kretprobe(&krp_get_io_buf);
+        register_kprobe(&kp_vfe_out_done);
         hooks_installed = true;
-        pr_info("[KPM] 双 Hook 已成功挂载，准备就绪！\n");
-        return 0;
+        pr_info("[KPM] Hooks installed.\n");
     }
-    
-    if (cmd[0] == 'c' && hooks_installed) {
-        // 触发一次抓帧 (安全机制：每次只抓一帧，防止内存 OOM)
+    else if (cmd[0] == 'c' && hooks_installed) {
         capture_enabled = true;
-        pr_info("[KPM] 开启抓帧，等待下一帧到来...\n");
+        pr_info("[KPM] Capture requested.\n");
+    }
+    else if (cmd[0] == 't' && hooks_installed) {
+        tamper_enabled = !tamper_enabled;
+        pr_info("[KPM] Tamper mode toggled.\n");
     }
     return 0;
 }
@@ -237,5 +288,5 @@ KPM_EXIT(cam_kpm_exit) {
         unregister_kprobe(&kp_vfe_out_done);
     }
     misc_deregister(&cam_dump_dev);
-    pr_info("[KPM] 模块已卸载。\n");
+    pr_info("[KPM] Unloaded.\n");
 }
