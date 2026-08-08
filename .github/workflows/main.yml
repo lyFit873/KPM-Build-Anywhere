@@ -1,0 +1,37 @@
+name: Build KPM Module
+
+on:
+  workflow_dispatch: # 允许在网页端手动点击按钮触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 获取源代码
+        uses: actions/checkout@v3
+
+      - name: 配置 Android NDK 环境
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r25c # 使用最稳定的 NDK 版本
+
+      - name: 编译 KPM
+        run: |
+          export NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}
+          # 赋予构建脚本执行权限并执行（兼容常见模板）
+          if [ -f "build.sh" ]; then
+            chmod +x build.sh
+            ./build.sh
+          else
+            make
+          fi
+
+      - name: 打包并上传成品
+        uses: actions/upload-artifact@v3
+        with:
+          name: KPM-Output
+          path: |
+            ./*.kpm
+            out/*.kpm
+            build/*.kpm
