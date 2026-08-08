@@ -1,6 +1,9 @@
 #include <linux/types.h>
-#include "kputils.h"
-#include "common.h"
+// 彻底抛弃模板头文件，强制将自定义函数映射为 KPM 底层标准符号
+#define KPM_INIT(fn) int kpi_init(void)
+#define KPM_CTL0(fn) int kpi_ctl0(char *arg)
+#define KPM_EXIT(fn) void kpi_exit(void)
+
 
 // ==========================================
 // 1. 无头文件生存指南：手搓必需的底层结构
