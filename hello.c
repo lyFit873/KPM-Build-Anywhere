@@ -1,9 +1,31 @@
-#include <linux/types.h>
-// 彻底抛弃模板头文件，强制将自定义函数映射为 KPM 底层标准符号
+// ==========================================
+// 0. 盘古开天：手动定义所有基础 C 语言类型 (ARM64)
+// ==========================================
+#define NULL ((void *)0)
+typedef unsigned long size_t;
+typedef unsigned long uintptr_t;
+typedef unsigned long phys_addr_t;
+typedef unsigned long dma_addr_t;
+
+typedef signed char int8_t;
+typedef unsigned char uint8_t;
+typedef short int16_t;
+typedef unsigned short uint16_t;
+typedef int int32_t;
+typedef unsigned int uint32_t;
+typedef unsigned int u32;
+typedef long long int64_t;
+typedef unsigned long long uint64_t;
+typedef unsigned long long u64;
+
+typedef int bool;
+#define true 1
+#define false 0
+
+// 彻底抛弃模板头文件，强制映射 KPM 底层符号
 #define KPM_INIT(fn) int kpi_init(void)
 #define KPM_CTL0(fn) int kpi_ctl0(char *arg)
 #define KPM_EXIT(fn) void kpi_exit(void)
-
 
 // ==========================================
 // 1. 无头文件生存指南：手搓必需的底层结构
@@ -85,7 +107,7 @@ struct cam_isp_hw_done_event_data {
 struct iova_map_entry { uint32_t iova; int32_t buf_handle; };
 static struct iova_map_entry iova_map[MAX_MAP_ENTRIES];
 static int map_idx = 0;
-static int map_lock = 0; // 手写原子锁，彻底抛弃 spinlock.h
+static int map_lock = 0; // 手写原子锁
 
 static void record_iova_mapping(uint32_t iova, int32_t handle) {
     while (__sync_lock_test_and_set(&map_lock, 1)); 
@@ -130,7 +152,7 @@ static int entry_cam_mem_get_io_buf(struct kretprobe_instance *ri, struct pt_reg
 static int ret_cam_mem_get_io_buf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct hook_a_data *data = (struct hook_a_data *)ri->data;
     if (data->iova_ptr) {
-        dma_addr_t iova = *(data->iova_ptr); // 直接安全解引用
+        dma_addr_t iova = *(data->iova_ptr); 
         record_iova_mapping((uint32_t)iova, data->buf_handle);
     }
     return 0;
@@ -169,7 +191,7 @@ static int pre_vfe_out_done(struct kprobe *p, struct pt_regs *regs) {
             }
         }
 
-        // [截获画面] (由软中断上下文执行，使用内核极速 memcpy)
+        // [截获画面]
         if (capture_status == 1 && cached_frame && p_memcpy) {
             size_t copy_len = len > MAX_FRAME_SIZE ? MAX_FRAME_SIZE : len;
             p_memcpy(cached_frame, (void *)vaddr, copy_len);
@@ -212,22 +234,19 @@ KPM_CTL0(cam_kpm_control0) {
         hooks_installed = true;
         return 0;
     }
-    // 请求抓取一帧
     else if (cmd == 'c' && hooks_installed) {
         capture_status = 1;
         return 0;
     }
-    // 开关画面篡改
     else if (cmd == 't' && hooks_installed) {
         tamper_enabled = !tamper_enabled;
         return 0;
     }
-    // 读取画面 (由用户态传入内存地址的 16 进制字符串，如 "r 7ffffff000")
     else if (cmd == 'r' && hooks_installed) {
-        if (capture_status != 2) return -11; // -EAGAIN，告诉用户态数据还没好
+        if (capture_status != 2) return -11; 
 
         unsigned long user_addr = 0;
-        int i = 2; // 跳过 "r "
+        int i = 2; 
         while (arg[i]) {
             char c = arg[i];
             if (c == '\n' || c == '\r') break;
@@ -240,11 +259,10 @@ KPM_CTL0(cam_kpm_control0) {
         }
 
         if (user_addr && cached_size > 0) {
-            // 前 8 个字节写入实际文件大小，后面紧跟画面数据
             uint64_t size_header = (uint64_t)cached_size;
             p__copy_to_user((void *)user_addr, &size_header, 8);
             if (p__copy_to_user((void *)(user_addr + 8), cached_frame, cached_size) == 0) {
-                capture_status = 0; // 重置状态
+                capture_status = 0; 
                 return 0; 
             }
         }
