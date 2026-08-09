@@ -4,6 +4,11 @@
 #include <linux/string.h>
 #include <kputils.h>
 
+// 手动补充正确的函数原型声明,避免编译器把返回值当成 int 处理
+// (之前编译日志确认了 kp_malloc 被隐式声明为返回 int,导致64位指针被截断)
+extern void *kp_malloc(size_t size);
+extern void kp_free(void *mem);
+
 KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
