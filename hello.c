@@ -12,8 +12,12 @@ KPM_DESCRIPTION("Camera RDI raw data extractor via VFE bus hook");
 
 static long cam_kpm_init(const char *args, const char *event, void *reserved)
 {
-    pr_info("cam-raw-dump init, event: %s, args: %s\n", event, args);
-    pr_info("kernelpatch version: %x\n", kpver);
+    pr_info("cam-raw-dump: step1 before lookup\n");
+
+    unsigned long addr = kallsyms_lookup_name("cam_mem_get_cpu_buf");
+
+    pr_info("cam-raw-dump: step2 after lookup, addr=%lx\n", addr);
+
     return 0;
 }
 
