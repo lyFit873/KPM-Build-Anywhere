@@ -10,14 +10,14 @@ KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
 KPM_DESCRIPTION("Camera RDI raw data extractor via VFE bus hook");
 
-// 先用静态数组代替kp_malloc,规避动态分配的不确定性
-#define FRAME_SIZE (2 * 1024 * 1024)  // 先缩到1MB测试,不用32MB
-static unsigned char cached_frame[FRAME_SIZE];
+// 中转缓冲区,固定2MB,已验证稳定
+#define CHUNK_SIZE (2 * 1024 * 1024)
+static unsigned char chunk_buf[CHUNK_SIZE];
 
 static long cam_kpm_init(const char *args, const char *event, void *reserved)
 {
-    pr_info("cam-raw-dump: step1 init, static buffer at %p, size=%d\n",
-             cached_frame, FRAME_SIZE);
+    pr_info("cam-raw-dump: step1 init, chunk_buf at %p, size=%d\n",
+             chunk_buf, CHUNK_SIZE);
     return 0;
 }
 
