@@ -4,20 +4,20 @@
 #include <linux/string.h>
 #include <kputils.h>
 
-KPM_NAME("kpm-hello-demo");
+KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("bmax121");
-KPM_DESCRIPTION("KernelPatch Module Example");
+KPM_AUTHOR("KC");
+KPM_DESCRIPTION("Camera RDI raw data extractor via VFE bus hook");
 
-static long hello_init(const char *args, const char *event, void *reserved)
+static long cam_kpm_init(const char *args, const char *event, void *reserved)
 {
-    pr_info("hello init, event: %s, args: %s\n", event, args);
+    pr_info("cam-raw-dump init, event: %s, args: %s\n", event, args);
     pr_info("kernelpatch version: %x\n", kpver);
     return 0;
 }
 
-static long hello_control0(const char *args, char *__user out_msg, int outlen)
+static long cam_kpm_control0(const char *args, char *__user out_msg, int outlen)
 {
     char echo[64] = "echo: ";
     strncat(echo, args, 48);
@@ -25,12 +25,12 @@ static long hello_control0(const char *args, char *__user out_msg, int outlen)
     return 0;
 }
 
-static long hello_exit(void *reserved)
+static long cam_kpm_exit(void *reserved)
 {
-    pr_info("hello exit\n");
+    pr_info("cam-raw-dump exit\n");
     return 0;
 }
 
-KPM_INIT(hello_init);
-KPM_CTL0(hello_control0);
-KPM_EXIT(hello_exit);
+KPM_INIT(cam_kpm_init);
+KPM_CTL0(cam_kpm_control0);
+KPM_EXIT(cam_kpm_exit);
