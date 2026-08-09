@@ -12,11 +12,13 @@ KPM_DESCRIPTION("Camera RDI raw data extractor via VFE bus hook");
 
 static long cam_kpm_init(const char *args, const char *event, void *reserved)
 {
-    pr_info("cam-raw-dump: step1 before lookup\n");
+    pr_info("cam-raw-dump: step1 before lookup1\n");
+    unsigned long addr1 = kallsyms_lookup_name("cam_mem_get_cpu_buf");
+    pr_info("cam-raw-dump: step2 addr1=%lx\n", addr1);
 
-    unsigned long addr = kallsyms_lookup_name("cam_mem_get_cpu_buf");
-
-    pr_info("cam-raw-dump: step2 after lookup, addr=%lx\n", addr);
+    pr_info("cam-raw-dump: step3 before lookup2\n");
+    unsigned long addr2 = kallsyms_lookup_name("cam_mem_get_io_buf");
+    pr_info("cam-raw-dump: step4 addr2=%lx\n", addr2);
 
     return 0;
 }
