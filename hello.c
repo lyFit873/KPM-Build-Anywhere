@@ -1,266 +1,212 @@
 // ==========================================
-// 0. 盘古开天：手动定义所有基础 C 语言类型 (ARM64)
+// hello.c —— KPM 摄像头 RDI 原始数据提取模块
+// 基于 KernelPatch 官方 hook.h / kputils.h API
+// ⚠️ 编译前必须核对: hook_fargs_t 系列结构体里访问
+//    原函数参数值/返回值的具体字段名(本代码里标注为
+//    TODO 的地方),对照 bmax121/KernelPatch 仓库
+//    kpms/demo-inlinehook/ 目录下的真实示例源码
 // ==========================================
-#define NULL ((void *)0)
-typedef unsigned long size_t;
-typedef unsigned long uintptr_t;
-typedef unsigned long phys_addr_t;
-typedef unsigned long dma_addr_t;
 
-typedef signed char int8_t;
-typedef unsigned char uint8_t;
-typedef short int16_t;
-typedef unsigned short uint16_t;
-typedef int int32_t;
-typedef unsigned int uint32_t;
-typedef unsigned int u32;
-typedef long long int64_t;
-typedef unsigned long long uint64_t;
-typedef unsigned long long u64;
+#include <compiler.h>
+#include <kpmodule.h>
+#include <hook.h>
+#include <kputils.h>
+#include <linux/printk.h>
+#include <linux/string.h>
 
-typedef int bool;
-#define true 1
-#define false 0
+KPM_NAME("cam-raw-dump");
+KPM_VERSION("1.0.0");
+KPM_LICENSE("GPL v2");
+KPM_AUTHOR("KC");
+KPM_DESCRIPTION("Camera RDI raw data extractor via VFE bus hook");
 
-// 彻底抛弃模板头文件，强制映射 KPM 底层符号
-#define KPM_INIT(fn) int kpi_init(void)
-#define KPM_CTL0(fn) int kpi_ctl0(char *arg)
-#define KPM_EXIT(fn) void kpi_exit(void)
-
-// ==========================================
-// 1. 无头文件生存指南：手搓必需的底层结构
-// ==========================================
-struct hlist_node { struct hlist_node *next, **pprev; };
-struct hlist_head { struct hlist_node *first; };
-struct list_head { struct list_head *next, *prev; };
-typedef struct { volatile unsigned int slock; } raw_spinlock_t;
-typedef u32 kprobe_opcode_t;
-
-struct kprobe; struct pt_regs;
-typedef int (*kprobe_pre_handler_t) (struct kprobe *, struct pt_regs *);
-typedef void (*kprobe_post_handler_t) (struct kprobe *, struct pt_regs *, unsigned long flags);
-typedef int (*kprobe_fault_handler_t) (struct kprobe *, struct pt_regs *, int trapnr);
-
-struct kprobe {
-    struct hlist_node hlist;
-    struct list_head list;
-    unsigned long nmissed;
-    phys_addr_t addr;
-    const char *symbol_name;
-    unsigned int offset;
-    kprobe_pre_handler_t pre_handler;
-    kprobe_post_handler_t post_handler;
-    kprobe_fault_handler_t fault_handler;
-    kprobe_opcode_t opcode;
-};
-
-struct kretprobe_instance; struct kretprobe;
-typedef int (*kretprobe_handler_t) (struct kretprobe_instance *, struct pt_regs *);
-
-struct kretprobe {
-    struct kprobe kp;
-    kretprobe_handler_t handler;
-    kretprobe_handler_t entry_handler;
-    int maxactive;
-    int nmissed;
-    size_t data_size;
-    struct hlist_head free_instances;
-    raw_spinlock_t lock;
-};
-
-struct kretprobe_instance {
-    struct hlist_node hlist;
-    struct kretprobe *rp;
-    kprobe_opcode_t *ret_addr;
-    void *task;
-    char data[0];
-};
-
-extern int register_kprobe(struct kprobe *p);
-extern void unregister_kprobe(struct kprobe *p);
-extern int register_kretprobe(struct kretprobe *rp);
-extern void unregister_kretprobe(struct kretprobe *rp);
-extern unsigned long kallsyms_lookup_name(const char *name);
-
-// ==========================================
-// 2. 动态函数指针 (绕过环境检查)
-// ==========================================
+// ------------------------------------------
+// 动态符号指针,init阶段通过kallsyms_lookup_name获取
+// ------------------------------------------
 static int (*p_cam_mem_get_cpu_buf)(int32_t buf_handle, uintptr_t *vaddr_ptr, size_t *len) = NULL;
-static void *(*p_vmalloc)(unsigned long size) = NULL;
-static void (*p_vfree)(const void *addr) = NULL;
-static unsigned long (*p__copy_to_user)(void *to, const void *from, unsigned long n) = NULL;
-static void *(*p_memcpy)(void *dest, const void *src, size_t n) = NULL;
+
+static unsigned long addr_get_io_buf = 0;
+static unsigned long addr_vfe_out_done = 0;
+
+// ------------------------------------------
+// IOVA -> buf_handle 映射表 (Hook A 写入, Hook B 查询)
+// ------------------------------------------
+#define MAX_MAP_ENTRIES 64
+struct iova_map_entry { uint32_t iova; int32_t buf_handle; };
+static struct iova_map_entry iova_map[MAX_MAP_ENTRIES];
+static int map_idx = 0;
+
+static void record_iova_mapping(uint32_t iova, int32_t handle)
+{
+    iova_map[map_idx].iova = iova;
+    iova_map[map_idx].buf_handle = handle;
+    map_idx = (map_idx + 1) % MAX_MAP_ENTRIES;
+}
+
+static int32_t lookup_buf_handle(uint32_t iova)
+{
+    int i;
+    for (i = 0; i < MAX_MAP_ENTRIES; i++) {
+        int idx = (map_idx - 1 - i + MAX_MAP_ENTRIES) % MAX_MAP_ENTRIES;
+        if (iova_map[idx].iova == iova)
+            return iova_map[idx].buf_handle;
+    }
+    return 0;
+}
+
+// ------------------------------------------
+// 抓取状态机 + 帧缓冲(供 control0 导出用)
+// ------------------------------------------
+#define MAX_FRAME_SIZE (32 * 1024 * 1024)  // 先按32MB留,不够再调
+static volatile int capture_status = 0;    // 0=空闲 1=等待抓取 2=已就绪
+static void *cached_frame = NULL;
+static size_t cached_size = 0;
 
 // ==========================================
-// 3. 核心业务逻辑与状态机
+// Hook A: cam_mem_get_io_buf
+// buf_handle(输入参数) -> IOVA(输出参数,一般是个指针参数)
+// TODO: 确认 cam_mem_get_io_buf 的真实函数签名(参数个数/顺序),
+//       对照 cam_mem_mgr.c 里 EXPORT_SYMBOL(cam_mem_get_io_buf)
+//       上方的函数定义来核对参数个数,决定用 hook_wrap 几号参数变体
+// ==========================================
+static void before_get_io_buf(hook_fargs3_t *args, void *udata)
+{
+    // TODO: 确认参数访问字段名(可能是 args->arg0 或 args->args[0] 等,
+    //       需要看 hook.h 里 hook_fargsN_t 的真实定义)
+    // 这里先假设 args->arg0 = buf_handle (第一个参数)
+    // 用 args->local.data0 把 buf_handle 暂存下来,供 after 阶段用
+    args->local.data0 = args->arg0;
+}
+
+static void after_get_io_buf(hook_fargs3_t *args, void *udata)
+{
+    int32_t buf_handle = (int32_t)args->local.data0;
+    // TODO: 确认输出参数(IOVA指针)在 hook_fargs 里怎么取,
+    //       这里假设第三个参数是 dma_addr_t* 类型的输出指针 args->arg2
+    dma_addr_t *iova_ptr = (dma_addr_t *)args->arg2;
+    if (iova_ptr && buf_handle) {
+        uint32_t iova = (uint32_t)(*iova_ptr);
+        record_iova_mapping(iova, buf_handle);
+    }
+}
+
+// ==========================================
+// Hook B: cam_vfe_bus_ver3_handle_vfe_out_done_bottom_half
+// 帧完成回调,从事件结构体里取 last_consumed_addr
+// TODO: 确认这个函数的真实参数个数/顺序,来自
+//       cam_vfe_bus_ver3.c 约2433行的函数定义
 // ==========================================
 #define CAM_NUM_OUT_PER_COMP_IRQ_MAX 6
 struct cam_isp_hw_done_event_data {
     uint32_t num_handles;
     uint32_t resource_handle[CAM_NUM_OUT_PER_COMP_IRQ_MAX];
-    uint32_t last_consumed_addr[CAM_NUM_OUT_PER_COMP_IRQ_MAX]; 
+    uint32_t last_consumed_addr[CAM_NUM_OUT_PER_COMP_IRQ_MAX];
     uint64_t timestamp;
 };
 
-#define MAX_MAP_ENTRIES 256
-struct iova_map_entry { uint32_t iova; int32_t buf_handle; };
-static struct iova_map_entry iova_map[MAX_MAP_ENTRIES];
-static int map_idx = 0;
-static int map_lock = 0; // 手写原子锁
+static void before_vfe_out_done(hook_fargs2_t *args, void *udata)
+{
+    // TODO: 确认 cam_isp_hw_done_event_data* 在参数列表第几位
+    struct cam_isp_hw_done_event_data *evt =
+        (struct cam_isp_hw_done_event_data *)args->arg1;
 
-static void record_iova_mapping(uint32_t iova, int32_t handle) {
-    while (__sync_lock_test_and_set(&map_lock, 1)); 
-    iova_map[map_idx].iova = iova;
-    iova_map[map_idx].buf_handle = handle;
-    map_idx = (map_idx + 1) % MAX_MAP_ENTRIES;
-    __sync_lock_release(&map_lock);
-}
+    if (capture_status != 1 || !evt || evt->num_handles == 0)
+        return;
+    if (!p_cam_mem_get_cpu_buf || !cached_frame)
+        return;
 
-static int32_t lookup_buf_handle(uint32_t iova) {
-    int i; int32_t handle = 0;
-    while (__sync_lock_test_and_set(&map_lock, 1));
-    for (i = 0; i < MAX_MAP_ENTRIES; i++) {
-        int idx = (map_idx - 1 - i + MAX_MAP_ENTRIES) % MAX_MAP_ENTRIES;
-        if (iova_map[idx].iova == iova) { handle = iova_map[idx].buf_handle; break; }
+    uint32_t iova = evt->last_consumed_addr[0];
+    int32_t buf_handle = lookup_buf_handle(iova);
+    if (!buf_handle)
+        return;
+
+    uintptr_t vaddr = 0;
+    size_t len = 0;
+    if (p_cam_mem_get_cpu_buf(buf_handle, &vaddr, &len) == 0 && vaddr) {
+        size_t copy_len = len > MAX_FRAME_SIZE ? MAX_FRAME_SIZE : len;
+        memcpy(cached_frame, (void *)vaddr, copy_len);
+        cached_size = copy_len;
+        capture_status = 2;
+        pr_info("cam-raw-dump: frame captured, size=%zu\n", copy_len);
     }
-    __sync_lock_release(&map_lock);
-    return handle;
 }
-
-// 状态控制
-static volatile int capture_status = 0; // 0:空闲, 1:等待抓取, 2:抓取完成
-static bool hooks_installed = false;
-static void *cached_frame = NULL;
-static size_t cached_size = 0;
-#define MAX_FRAME_SIZE (80 * 1024 * 1024) // 80MB
 
 // ==========================================
-// 4. 双 Hook 实现
+// 生命周期回调
 // ==========================================
-struct hook_a_data { int32_t buf_handle; dma_addr_t *iova_ptr; };
+static long cam_kpm_init(const char *args, const char *event, void *reserved)
+{
+    p_cam_mem_get_cpu_buf = (typeof(p_cam_mem_get_cpu_buf))kallsyms_lookup_name("cam_mem_get_cpu_buf");
+    addr_get_io_buf = kallsyms_lookup_name("cam_mem_get_io_buf");
+    addr_vfe_out_done = kallsyms_lookup_name("cam_vfe_bus_ver3_handle_vfe_out_done_bottom_half");
 
-static int entry_cam_mem_get_io_buf(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    struct hook_a_data *data = (struct hook_a_data *)ri->data;
-    u64 *x = (u64 *)regs; 
-    data->buf_handle = (int32_t)x[0];
-    data->iova_ptr = (dma_addr_t *)x[2];
-    return 0;
-}
-
-static int ret_cam_mem_get_io_buf(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    struct hook_a_data *data = (struct hook_a_data *)ri->data;
-    if (data->iova_ptr) {
-        dma_addr_t iova = *(data->iova_ptr); 
-        record_iova_mapping((uint32_t)iova, data->buf_handle);
-    }
-    return 0;
-}
-
-static struct kretprobe krp_get_io_buf = {
-    .handler = ret_cam_mem_get_io_buf,
-    .entry_handler = entry_cam_mem_get_io_buf,
-    .data_size = sizeof(struct hook_a_data),
-    .maxactive = 32,
-    .kp.symbol_name = "cam_mem_get_io_buf",
-};
-
-static int pre_vfe_out_done(struct kprobe *p, struct pt_regs *regs) {
-    struct cam_isp_hw_done_event_data *evt;
-    uint32_t iova, buf_handle;
-    uintptr_t vaddr = 0; size_t len = 0;
-    u64 *x = (u64 *)regs;
-
-    // 如果不在抓取状态，直接放行，零性能损耗
-    if (capture_status == 0 || !p_cam_mem_get_cpu_buf) return 0;
-
-    evt = (struct cam_isp_hw_done_event_data *)x[1]; 
-    if (!evt || evt->num_handles == 0 || evt->num_handles > CAM_NUM_OUT_PER_COMP_IRQ_MAX) return 0;
-
-    iova = evt->last_consumed_addr[0];
-    buf_handle = lookup_buf_handle(iova);
-
-    if (buf_handle != 0 && p_cam_mem_get_cpu_buf(buf_handle, &vaddr, &len) == 0 && vaddr != 0) {
-        // [截获画面]
-        if (capture_status == 1 && cached_frame && p_memcpy) {
-            size_t copy_len = len > MAX_FRAME_SIZE ? MAX_FRAME_SIZE : len;
-            p_memcpy(cached_frame, (void *)vaddr, copy_len);
-            cached_size = copy_len;
-            capture_status = 2; // 通知用户态准备就绪
-        }
-    }
-    return 0; 
-}
-
-static struct kprobe kp_vfe_out_done = {
-    .symbol_name = "cam_vfe_bus_ver3_handle_vfe_out_done_bottom_half",
-    .pre_handler = pre_vfe_out_done,
-};
-
-// ==========================================
-// 5. KPM 极简通信接口
-// ==========================================
-KPM_INIT(cam_kpm_init) { return 0; }
-
-KPM_CTL0(cam_kpm_control0) {
-    if (!arg) return -1;
-    char cmd = arg[0];
-
-    // 初始化 Hook 和环境
-    if (cmd == '1' && !hooks_installed) {
-        p_cam_mem_get_cpu_buf = (void *)kallsyms_lookup_name("cam_mem_get_cpu_buf");
-        p_vmalloc = (void *)kallsyms_lookup_name("vmalloc");
-        p_vfree = (void *)kallsyms_lookup_name("vfree");
-        p__copy_to_user = (void *)kallsyms_lookup_name("_copy_to_user");
-        p_memcpy = (void *)kallsyms_lookup_name("memcpy");
-
-        if (!p_cam_mem_get_cpu_buf || !p_vmalloc || !p__copy_to_user) return -1;
-
-        if (!cached_frame) cached_frame = p_vmalloc(MAX_FRAME_SIZE);
-        
-        register_kretprobe(&krp_get_io_buf);
-        register_kprobe(&kp_vfe_out_done);
-        hooks_installed = true;
-        return 0;
-    }
-    // 请求抓取
-    else if (cmd == 'c' && hooks_installed) {
-        capture_status = 1;
-        return 0;
-    }
-    // 读取画面 (由用户态传入内存地址)
-    else if (cmd == 'r' && hooks_installed) {
-        if (capture_status != 2) return -11; 
-
-        unsigned long user_addr = 0;
-        int i = 2; 
-        while (arg[i]) {
-            char c = arg[i];
-            if (c == '\n' || c == '\r') break;
-            user_addr <<= 4;
-            if (c >= '0' && c <= '9') user_addr |= (c - '0');
-            else if (c >= 'a' && c <= 'f') user_addr |= (c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') user_addr |= (c - 'A' + 10);
-            else break;
-            i++;
-        }
-
-        if (user_addr && cached_size > 0) {
-            uint64_t size_header = (uint64_t)cached_size;
-            p__copy_to_user((void *)user_addr, &size_header, 8);
-            if (p__copy_to_user((void *)(user_addr + 8), cached_frame, cached_size) == 0) {
-                capture_status = 0; 
-                return 0; 
-            }
-        }
+    if (!p_cam_mem_get_cpu_buf || !addr_get_io_buf || !addr_vfe_out_done) {
+        pr_err("cam-raw-dump: symbol lookup failed (cpu_buf=%p io_buf=%p vfe_done=%p)\n",
+               p_cam_mem_get_cpu_buf, (void *)addr_get_io_buf, (void *)addr_vfe_out_done);
         return -1;
     }
+
+    cached_frame = kp_malloc(MAX_FRAME_SIZE);
+    if (!cached_frame) {
+        pr_err("cam-raw-dump: alloc frame buffer failed\n");
+        return -1;
+    }
+
+    // TODO: hook_wrap3 / hook_wrap2 的具体调用签名需对照 hook.h 核实
+    hook_wrap3((void *)addr_get_io_buf, before_get_io_buf, after_get_io_buf, NULL);
+    hook_wrap2((void *)addr_vfe_out_done, before_vfe_out_done, NULL, NULL);
+
+    pr_info("cam-raw-dump: init ok, kernelpatch version: %x\n", kpver);
     return 0;
 }
 
-KPM_EXIT(cam_kpm_exit) {
-    if (hooks_installed) {
-        unregister_kretprobe(&krp_get_io_buf);
-        unregister_kprobe(&kp_vfe_out_done);
+static long cam_kpm_control0(const char *args, char *__user out_msg, int outlen)
+{
+    if (!args) return -1;
+    char cmd = args[0];
+
+    if (cmd == 'c') {
+        // 触发一次抓取
+        capture_status = 1;
+        compat_copy_to_user(out_msg, "capture armed", 15);
+        return 0;
     }
-    if (cached_frame && p_vfree) p_vfree(cached_frame);
+    else if (cmd == 's') {
+        // 查询状态
+        char buf[32];
+        snprintf(buf, sizeof(buf), "status=%d size=%zu", capture_status, cached_size);
+        compat_copy_to_user(out_msg, buf, strlen(buf) + 1);
+        return 0;
+    }
+    else if (cmd == 'r') {
+        // 读取:约定 args+2 开始是用户态传入的目标地址(hex字符串)
+        // TODO: 这段用户态地址解析目前用compat_copy_to_user按块拷贝,
+        //       如果一帧数据超过outlen需要分块传输,当前版本假设
+        //       out_msg缓冲区足够大或者只做小尺寸测试验证用
+        if (capture_status != 2) {
+            compat_copy_to_user(out_msg, "not ready", 10);
+            return -1;
+        }
+        // 仅做状态回传示例,真正大块数据导出建议改用落盘方案(见下方说明)
+        compat_copy_to_user(out_msg, cached_frame, outlen < cached_size ? outlen : cached_size);
+        capture_status = 0;
+        return 0;
+    }
+    return 0;
 }
+
+static long cam_kpm_exit(void *reserved)
+{
+    if (addr_get_io_buf)
+        unhook((void *)addr_get_io_buf);
+    if (addr_vfe_out_done)
+        unhook((void *)addr_vfe_out_done);
+    if (cached_frame)
+        kp_free(cached_frame);
+    pr_info("cam-raw-dump: exit\n");
+    return 0;
+}
+
+KPM_INIT(cam_kpm_init);
+KPM_CTL0(cam_kpm_control0);
+KPM_EXIT(cam_kpm_exit);
