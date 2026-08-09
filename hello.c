@@ -20,6 +20,10 @@ static long cam_kpm_init(const char *args, const char *event, void *reserved)
     unsigned long addr2 = kallsyms_lookup_name("cam_mem_get_io_buf");
     pr_info("cam-raw-dump: step4 addr2=%lx\n", addr2);
 
+    pr_info("cam-raw-dump: step5 before lookup3\n");
+    unsigned long addr3 = kallsyms_lookup_name("cam_vfe_bus_ver3_handle_vfe_out_done_bottom_half");
+    pr_info("cam-raw-dump: step6 addr3=%lx\n", addr3);
+
     return 0;
 }
 
