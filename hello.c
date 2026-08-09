@@ -11,7 +11,7 @@ KPM_AUTHOR("KC");
 KPM_DESCRIPTION("Camera RDI raw data extractor via VFE bus hook");
 
 // 先用静态数组代替kp_malloc,规避动态分配的不确定性
-#define FRAME_SIZE (8 * 1024 * 1024)  // 先缩到1MB测试,不用32MB
+#define FRAME_SIZE (4 * 1024 * 1024)  // 先缩到1MB测试,不用32MB
 static unsigned char cached_frame[FRAME_SIZE];
 
 static long cam_kpm_init(const char *args, const char *event, void *reserved)
