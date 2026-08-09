@@ -1,7 +1,7 @@
 name: Build KPM Module
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
 
 jobs:
   build:
@@ -9,6 +9,10 @@ jobs:
     steps:
       - name: 获取源代码
         uses: actions/checkout@v4
+
+      - name: 获取 KernelPatch 源码
+        run: |
+          git clone --depth 1 --branch 0.11.3 https://github.com/bmax121/KernelPatch.git ../KernelPatch-0.11.3
 
       - name: 配置 Android NDK 环境
         uses: nttld/setup-ndk@v1
