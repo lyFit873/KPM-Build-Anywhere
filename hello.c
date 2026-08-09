@@ -10,19 +10,19 @@ KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
 KPM_DESCRIPTION("Camera RDI raw data extractor via VFE bus hook");
 
+#define MAX_FRAME_SIZE (32 * 1024 * 1024)
+static void *cached_frame = NULL;
+
 static long cam_kpm_init(const char *args, const char *event, void *reserved)
 {
-    pr_info("cam-raw-dump: step1 before lookup1\n");
-    unsigned long addr1 = kallsyms_lookup_name("cam_mem_get_cpu_buf");
-    pr_info("cam-raw-dump: step2 addr1=%lx\n", addr1);
+    pr_info("cam-raw-dump: step1 before malloc\n");
+    cached_frame = kp_malloc(MAX_FRAME_SIZE);
+    pr_info("cam-raw-dump: step2 after malloc, ptr=%p\n", cached_frame);
 
-    pr_info("cam-raw-dump: step3 before lookup2\n");
-    unsigned long addr2 = kallsyms_lookup_name("cam_mem_get_io_buf");
-    pr_info("cam-raw-dump: step4 addr2=%lx\n", addr2);
-
-    pr_info("cam-raw-dump: step5 before lookup3\n");
-    unsigned long addr3 = kallsyms_lookup_name("cam_vfe_bus_ver3_handle_vfe_out_done_bottom_half");
-    pr_info("cam-raw-dump: step6 addr3=%lx\n", addr3);
+    if (!cached_frame) {
+        pr_err("cam-raw-dump: malloc failed\n");
+        return -1;
+    }
 
     return 0;
 }
@@ -37,6 +37,8 @@ static long cam_kpm_control0(const char *args, char *__user out_msg, int outlen)
 
 static long cam_kpm_exit(void *reserved)
 {
+    if (cached_frame)
+        kp_free(cached_frame);
     pr_info("cam-raw-dump exit\n");
     return 0;
 }
