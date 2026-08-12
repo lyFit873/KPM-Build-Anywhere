@@ -262,6 +262,8 @@ static void before_vfe_out_done
 
     if(!buf_handle)
         return;
+
+    
     uintptr_t vaddr = 0;
 
     size_t len = 0;
@@ -540,6 +542,8 @@ static long cam_kpm_init
 
     return 0;
 }
+
+
 static long cam_kpm_control0
 (
     const char *args,
