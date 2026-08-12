@@ -167,7 +167,6 @@ static void before_vfe_out_done(hook_fargs2_t *args, void *udata)
 }
 
 
-// ===== 第一部分结束，下一条接第二部分 =====
 static long cam_kpm_init(
     const char *args,
     const char *event,
