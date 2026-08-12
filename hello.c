@@ -2,7 +2,6 @@
 #include <kpmodule.h>
 #include <linux/printk.h>
 #include <linux/string.h>
-#include <linux/slab.h>
 #include <kputils.h>
 #include <hook.h>
 
