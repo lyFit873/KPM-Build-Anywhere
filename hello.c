@@ -413,7 +413,7 @@ static long cam_kpm_init
         kmalloc
         (
             CHUNK_SIZE,
-            GFP_KERNEL
+            0
         );
 
 
