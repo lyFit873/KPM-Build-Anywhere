@@ -21,7 +21,7 @@ KPM_DESCRIPTION("Camera RDI raw data extractor via VFE bus hook");
 #define CHUNK_SIZE (2 * 1024 * 1024)
 
 
-static unsigned char *chunk_buf = NULL;
+static unsigned char chunk_buf[CHUNK_SIZE];
 
 
 
@@ -406,31 +406,6 @@ static long cam_kpm_init
         "cam-raw-dump: step1 symbol lookup\n"
     );
 
-
-
-    chunk_buf =
-        kmalloc
-        (
-            CHUNK_SIZE,
-            0
-        );
-
-
-
-    if(!chunk_buf)
-    {
-        pr_err
-        (
-            "cam-raw-dump: buffer alloc failed\n"
-        );
-
-        return -1;
-    }
-
-
-
-
-
     p_filp_open =
         (void *)kallsyms_lookup_name
         (
@@ -629,15 +604,6 @@ static long cam_kpm_exit
     }
 
 
-
-    if(chunk_buf)
-    {
-        kfree(chunk_buf);
-        chunk_buf = NULL;
-    }
-
-
-
     pr_info
     (
         "cam-raw-dump exit\n"
@@ -646,9 +612,6 @@ static long cam_kpm_exit
 
     return 0;
 }
-
-
-
 
 
 
