@@ -2,8 +2,10 @@
 #include <kpmodule.h>
 #include <linux/printk.h>
 #include <linux/string.h>
+#include <linux/slab.h>
 #include <kputils.h>
 #include <hook.h>
+
 
 KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.0.0");
@@ -16,35 +18,54 @@ KPM_DESCRIPTION("Camera RDI raw data extractor via VFE bus hook");
 #define O_CREAT  00000100
 #define O_TRUNC  00001000
 
+
 #define CHUNK_SIZE (2 * 1024 * 1024)
 
-static unsigned char chunk_buf[CHUNK_SIZE];
+
+static unsigned char *chunk_buf = NULL;
 
 
-// kernel symbols
-static void *(*p_filp_open)(const char *, int, unsigned short);
-static long (*p_kernel_write)(void *, const void *, unsigned long, long long *);
-static int (*p_filp_close)(void *, void *);
 
-static int (*p_cam_mem_get_cpu_buf)(int32_t, uintptr_t *, size_t *);
+/*
+ * kernel symbols
+ */
+
+static void *(*p_filp_open)
+(
+    const char *,
+    int,
+    unsigned short
+);
 
 
-// KPM hook API
-extern long hook_wrap2(void *func,
-                       void *before,
-                       void *after,
-                       void *udata);
+static long (*p_kernel_write)
+(
+    void *,
+    const void *,
+    unsigned long,
+    long long *
+);
 
-extern long hook_wrap3(void *func,
-                       void *before,
-                       void *after,
-                       void *udata);
 
-extern void unhook(void *func);
+static int (*p_filp_close)
+(
+    void *,
+    void *
+);
+
+
+
+static int (*p_cam_mem_get_cpu_buf)
+(
+    int32_t,
+    uintptr_t *,
+    size_t *
+);
 
 
 
 static unsigned long addr_get_io_buf = 0;
+
 static unsigned long addr_vfe_out_done = 0;
 
 
@@ -52,45 +73,59 @@ static unsigned long addr_vfe_out_done = 0;
 #define MAX_MAP_ENTRIES 64
 
 
-struct iova_map_entry {
+
+struct iova_map_entry
+{
     uint32_t iova;
     int32_t buf_handle;
 };
 
 
+
 static struct iova_map_entry iova_map[MAX_MAP_ENTRIES];
+
 static int map_idx = 0;
 
 
 
-static void record_iova_mapping(uint32_t iova,
-                                int32_t handle)
+static void record_iova_mapping
+(
+    uint32_t iova,
+    int32_t handle
+)
 {
     iova_map[map_idx].iova = iova;
     iova_map[map_idx].buf_handle = handle;
 
+
     map_idx++;
 
-    if (map_idx >= MAX_MAP_ENTRIES)
+
+    if(map_idx >= MAX_MAP_ENTRIES)
         map_idx = 0;
 }
 
 
 
-static int32_t lookup_buf_handle(uint32_t iova)
+static int32_t lookup_buf_handle
+(
+    uint32_t iova
+)
 {
     int i;
 
-    for (i = 0; i < MAX_MAP_ENTRIES; i++)
+
+    for(i = 0; i < MAX_MAP_ENTRIES; i++)
     {
         int idx =
             (map_idx - 1 - i + MAX_MAP_ENTRIES)
             % MAX_MAP_ENTRIES;
 
 
-        if (iova_map[idx].iova == iova)
+        if(iova_map[idx].iova == iova)
             return iova_map[idx].buf_handle;
     }
+
 
     return 0;
 }
@@ -108,28 +143,43 @@ static volatile int capture_status = 0;
 
 
 
-static void before_get_io_buf(hook_fargs3_t *args,
-                              void *udata)
+
+/*
+ * cam_mem_get_io_buf hook
+ */
+
+
+static void before_get_io_buf
+(
+    hook_fargs3_t *args,
+    void *udata
+)
 {
     args->local.data0 = args->arg0;
 }
 
 
 
-static void after_get_io_buf(hook_fargs3_t *args,
-                             void *udata)
+static void after_get_io_buf
+(
+    hook_fargs3_t *args,
+    void *udata
+)
 {
     int32_t handle =
         (int32_t)args->local.data0;
+
 
 
     dma_addr_t *iova_ptr =
         (dma_addr_t *)args->arg2;
 
 
-    if (iova_ptr && handle)
+
+    if(iova_ptr && handle)
     {
-        record_iova_mapping(
+        record_iova_mapping
+        (
             (uint32_t)(*iova_ptr),
             handle
         );
@@ -138,43 +188,64 @@ static void after_get_io_buf(hook_fargs3_t *args,
 
 
 
+
+
+
 #define CAM_NUM_OUT_PER_COMP_IRQ_MAX 6
 
 
-struct cam_isp_hw_done_event_data {
 
+struct cam_isp_hw_done_event_data
+{
     uint32_t num_handles;
 
-    uint32_t resource_handle[
+
+    uint32_t resource_handle
+    [
         CAM_NUM_OUT_PER_COMP_IRQ_MAX
     ];
 
-    uint32_t last_consumed_addr[
+
+    uint32_t last_consumed_addr
+    [
         CAM_NUM_OUT_PER_COMP_IRQ_MAX
     ];
+
 
     uint64_t timestamp;
 };
-static void before_vfe_out_done(hook_fargs2_t *args,
-                                void *udata)
+
+
+
+/*
+ * VFE output done hook
+ */
+
+
+static void before_vfe_out_done
+(
+    hook_fargs2_t *args,
+    void *udata
+)
 {
     struct cam_isp_hw_done_event_data *evt =
         (struct cam_isp_hw_done_event_data *)args->arg1;
 
 
-    if (capture_status != 1)
+
+    if(capture_status != 1)
         return;
 
 
-    if (!evt)
+    if(!evt)
         return;
 
 
-    if (evt->num_handles == 0)
+    if(evt->num_handles == 0)
         return;
 
 
-    if (!p_cam_mem_get_cpu_buf)
+    if(!p_cam_mem_get_cpu_buf)
         return;
 
 
@@ -183,51 +254,57 @@ static void before_vfe_out_done(hook_fargs2_t *args,
         evt->last_consumed_addr[0];
 
 
+
     int32_t buf_handle =
         lookup_buf_handle(iova);
 
 
 
-    if (!buf_handle)
+    if(!buf_handle)
         return;
-
-
-
     uintptr_t vaddr = 0;
+
     size_t len = 0;
 
 
-
-    if (p_cam_mem_get_cpu_buf(
+    if(p_cam_mem_get_cpu_buf
+       (
             buf_handle,
             &vaddr,
-            &len) != 0)
+            &len
+       ) != 0)
     {
         return;
     }
 
 
-    if (!vaddr || !len)
+
+    if(!vaddr || !len)
         return;
 
 
 
 
     void *f =
-        p_filp_open(
+        p_filp_open
+        (
             "/data/local/tmp/cam_frame.raw",
             O_CREAT | O_WRONLY | O_TRUNC,
-            0644);
+            0644
+        );
 
 
 
-    if (is_err_ptr(f))
+    if(is_err_ptr(f))
     {
-        pr_err(
+        pr_err
+        (
             "cam-raw-dump: open failed\n"
         );
+
         return;
     }
+
 
 
 
@@ -241,7 +318,7 @@ static void before_vfe_out_done(hook_fargs2_t *args,
 
 
 
-    while (remain > 0)
+    while(remain > 0)
     {
 
         size_t n =
@@ -251,18 +328,35 @@ static void before_vfe_out_done(hook_fargs2_t *args,
 
 
 
-        memcpy(
+        memcpy
+        (
             chunk_buf,
             (void *)src,
-            n);
+            n
+        );
 
 
 
-        p_kernel_write(
-            f,
-            chunk_buf,
-            n,
-            &pos);
+        long ret =
+            p_kernel_write
+            (
+                f,
+                chunk_buf,
+                n,
+                &pos
+            );
+
+
+
+        if(ret < 0)
+        {
+            pr_err
+            (
+                "cam-raw-dump: write failed\n"
+            );
+
+            break;
+        }
 
 
 
@@ -273,16 +367,21 @@ static void before_vfe_out_done(hook_fargs2_t *args,
 
 
 
-    p_filp_close(
+
+    p_filp_close
+    (
         f,
-        NULL);
+        NULL
+    );
 
 
 
     capture_status = 2;
 
 
-    pr_info(
+
+    pr_info
+    (
         "cam-raw-dump: frame written size=%zu\n",
         len
     );
@@ -292,73 +391,36 @@ static void before_vfe_out_done(hook_fargs2_t *args,
 
 
 
-static long cam_kpm_init(
-        const char *args,
-        const char *event,
-        void *reserved)
+
+static long cam_kpm_init
+(
+    const char *args,
+    const char *event,
+    void *reserved
+)
 {
 
-    pr_info(
+    pr_info
+    (
         "cam-raw-dump: step1 symbol lookup\n"
     );
 
 
 
-    p_filp_open =
-        (void *)kallsyms_lookup_name(
-            "filp_open"
-        );
-
-
-    p_kernel_write =
-        (void *)kallsyms_lookup_name(
-            "kernel_write"
-        );
-
-
-    p_filp_close =
-        (void *)kallsyms_lookup_name(
-            "filp_close"
-        );
-
-
-    p_cam_mem_get_cpu_buf =
-        (void *)kallsyms_lookup_name(
-            "cam_mem_get_cpu_buf"
+    chunk_buf =
+        kmalloc
+        (
+            CHUNK_SIZE,
+            GFP_KERNEL
         );
 
 
 
-    addr_get_io_buf =
-        kallsyms_lookup_name(
-            "cam_mem_get_io_buf"
-        );
-
-
-
-    addr_vfe_out_done =
-        kallsyms_lookup_name(
-            "cam_vfe_bus_ver3_handle_vfe_out_done_bottom_half"
-        );
-
-
-
-    pr_info(
-        "cam-raw-dump: symbols loaded\n"
-    );
-
-
-
-    if (!p_filp_open ||
-        !p_kernel_write ||
-        !p_filp_close ||
-        !p_cam_mem_get_cpu_buf ||
-        !addr_get_io_buf ||
-        !addr_vfe_out_done)
+    if(!chunk_buf)
     {
-
-        pr_err(
-            "cam-raw-dump: symbol lookup failed\n"
+        pr_err
+        (
+            "cam-raw-dump: buffer alloc failed\n"
         );
 
         return -1;
@@ -367,29 +429,110 @@ static long cam_kpm_init(
 
 
 
-    pr_info(
+
+    p_filp_open =
+        (void *)kallsyms_lookup_name
+        (
+            "filp_open"
+        );
+
+
+    p_kernel_write =
+        (void *)kallsyms_lookup_name
+        (
+            "kernel_write"
+        );
+
+
+    p_filp_close =
+        (void *)kallsyms_lookup_name
+        (
+            "filp_close"
+        );
+
+
+
+    p_cam_mem_get_cpu_buf =
+        (void *)kallsyms_lookup_name
+        (
+            "cam_mem_get_cpu_buf"
+        );
+
+
+
+    addr_get_io_buf =
+        kallsyms_lookup_name
+        (
+            "cam_mem_get_io_buf"
+        );
+
+
+
+    addr_vfe_out_done =
+        kallsyms_lookup_name
+        (
+            "cam_vfe_bus_ver3_handle_vfe_out_done_bottom_half"
+        );
+
+
+
+    pr_info
+    (
+        "cam-raw-dump: symbols loaded\n"
+    );
+
+
+
+    if(!p_filp_open ||
+       !p_kernel_write ||
+       !p_filp_close ||
+       !p_cam_mem_get_cpu_buf ||
+       !addr_get_io_buf ||
+       !addr_vfe_out_done)
+    {
+
+        pr_err
+        (
+            "cam-raw-dump: symbol lookup failed\n"
+        );
+
+
+        return -1;
+    }
+
+
+
+
+
+    pr_info
+    (
         "cam-raw-dump: installing hooks\n"
     );
 
 
 
-    hook_wrap3(
+    hook_wrap3
+    (
         (void *)addr_get_io_buf,
         before_get_io_buf,
         after_get_io_buf,
-        NULL);
+        NULL
+    );
 
 
 
-    hook_wrap2(
+    hook_wrap2
+    (
         (void *)addr_vfe_out_done,
         before_vfe_out_done,
         NULL,
-        NULL);
+        NULL
+    );
 
 
 
-    pr_info(
+    pr_info
+    (
         "cam-raw-dump: init ok\n"
     );
 
@@ -397,37 +540,34 @@ static long cam_kpm_init(
 
     return 0;
 }
-
-
-
-
-
-
-static long cam_kpm_control0(
-        const char *args,
-        char *__user out_msg,
-        int outlen)
+static long cam_kpm_control0
+(
+    const char *args,
+    char *__user out_msg,
+    int outlen
+)
 {
 
-    if (!args)
+    if(!args)
         return -1;
 
 
 
-    if (args[0] == 'c')
+    if(args[0] == 'c')
     {
 
         capture_status = 1;
 
 
-        compat_copy_to_user(
+        compat_copy_to_user
+        (
             out_msg,
             "armed",
             6
         );
 
     }
-    else if (args[0] == 's')
+    else if(args[0] == 's')
     {
 
         char buf[16] = "status=";
@@ -442,12 +582,14 @@ static long cam_kpm_control0(
 
 
 
-        compat_copy_to_user(
+        compat_copy_to_user
+        (
             out_msg,
             buf,
             9
         );
     }
+
 
 
     return 0;
@@ -458,29 +600,43 @@ static long cam_kpm_control0(
 
 
 
-static long cam_kpm_exit(
-        void *reserved)
+
+static long cam_kpm_exit
+(
+    void *reserved
+)
 {
 
-    if (addr_get_io_buf)
+    if(addr_get_io_buf)
     {
-        unhook(
+        unhook
+        (
             (void *)addr_get_io_buf
         );
     }
 
 
 
-    if (addr_vfe_out_done)
+    if(addr_vfe_out_done)
     {
-        unhook(
+        unhook
+        (
             (void *)addr_vfe_out_done
         );
     }
 
 
 
-    pr_info(
+    if(chunk_buf)
+    {
+        kfree(chunk_buf);
+        chunk_buf = NULL;
+    }
+
+
+
+    pr_info
+    (
         "cam-raw-dump exit\n"
     );
 
