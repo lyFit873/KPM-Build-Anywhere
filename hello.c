@@ -3,7 +3,6 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <kputils.h>
-#include <hook.h>
 
 KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.0.0");
@@ -17,10 +16,15 @@ KPM_DESCRIPTION("Camera RDI raw data extractor via VFE bus hook");
 #define CHUNK_SIZE (2 * 1024 * 1024)
 static unsigned char chunk_buf[CHUNK_SIZE];
 
+// ===== 所有跨模块调用的符号,统一走函数指针,避免 bl 指令重定位溢出 =====
 static void *(*p_filp_open)(const char *, int, unsigned short) = NULL;
 static long (*p_kernel_write)(void *, const void *, unsigned long, long long *) = NULL;
 static int (*p_filp_close)(void *, void *) = NULL;
 static int (*p_cam_mem_get_cpu_buf)(int32_t, uintptr_t *, size_t *) = NULL;
+
+static long (*p_hook_wrap2)(void *func, void *before, void *after, void *udata) = NULL;
+static long (*p_hook_wrap3)(void *func, void *before, void *after, void *udata) = NULL;
+static void (*p_unhook)(void *func) = NULL;
 
 static unsigned long addr_get_io_buf = 0;
 static unsigned long addr_vfe_out_done = 0;
@@ -55,16 +59,15 @@ static int is_err_ptr(void *ptr)
 static volatile int capture_status = 0;  // 0=空闲 1=等待抓取 2=完成
 
 // ===== Hook A: cam_mem_get_io_buf =====
-// TODO: 参数个数(3个)是之前的假设,需要对照 cam_mem_mgr.c 里
-// cam_mem_get_io_buf 真实函数签名核对,如果不是3个参数要换 hook_fargsN_t
+// TODO: 参数个数(3个)仍是假设,待对照 cam_mem_mgr.c 真实签名核实
 static void before_get_io_buf(hook_fargs3_t *args, void *udata)
 {
-    args->local.data0 = args->arg0;  // 暂存 buf_handle
+    args->local.data0 = args->arg0;
 }
 static void after_get_io_buf(hook_fargs3_t *args, void *udata)
 {
     int32_t buf_handle = (int32_t)args->local.data0;
-    dma_addr_t *iova_ptr = (dma_addr_t *)args->arg2;  // 假设第3个参数是IOVA输出指针
+    dma_addr_t *iova_ptr = (dma_addr_t *)args->arg2;
     if (iova_ptr && buf_handle)
         record_iova_mapping((uint32_t)(*iova_ptr), buf_handle);
 }
@@ -93,7 +96,6 @@ static void before_vfe_out_done(hook_fargs2_t *args, void *udata)
     uintptr_t vaddr = 0; size_t len = 0;
     if (p_cam_mem_get_cpu_buf(buf_handle, &vaddr, &len) != 0 || !vaddr) return;
 
-    // 分块写文件
     void *f = p_filp_open("/data/local/tmp/cam_frame.raw",
                            O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (is_err_ptr(f)) { pr_err("cam-raw-dump: open failed\n"); return; }
@@ -115,6 +117,8 @@ static void before_vfe_out_done(hook_fargs2_t *args, void *udata)
 
 static long cam_kpm_init(const char *args, const char *event, void *reserved)
 {
+    pr_info("cam-raw-dump: step1 symbol lookup\n");
+
     p_filp_open = (void *)kallsyms_lookup_name("filp_open");
     p_kernel_write = (void *)kallsyms_lookup_name("kernel_write");
     p_filp_close = (void *)kallsyms_lookup_name("filp_close");
@@ -122,16 +126,25 @@ static long cam_kpm_init(const char *args, const char *event, void *reserved)
     addr_get_io_buf = kallsyms_lookup_name("cam_mem_get_io_buf");
     addr_vfe_out_done = kallsyms_lookup_name("cam_vfe_bus_ver3_handle_vfe_out_done_bottom_half");
 
+    p_hook_wrap2 = (void *)kallsyms_lookup_name("hook_wrap2");
+    p_hook_wrap3 = (void *)kallsyms_lookup_name("hook_wrap3");
+    p_unhook = (void *)kallsyms_lookup_name("unhook");
+
+    pr_info("cam-raw-dump: step2 hook_wrap2=%p hook_wrap3=%p unhook=%p\n",
+            p_hook_wrap2, p_hook_wrap3, p_unhook);
+
     if (!p_filp_open || !p_kernel_write || !p_filp_close ||
-        !p_cam_mem_get_cpu_buf || !addr_get_io_buf || !addr_vfe_out_done) {
+        !p_cam_mem_get_cpu_buf || !addr_get_io_buf || !addr_vfe_out_done ||
+        !p_hook_wrap2 || !p_hook_wrap3 || !p_unhook) {
         pr_err("cam-raw-dump: symbol lookup failed\n");
         return -1;
     }
 
-    hook_wrap3((void *)addr_get_io_buf, before_get_io_buf, after_get_io_buf, NULL);
-    hook_wrap2((void *)addr_vfe_out_done, before_vfe_out_done, NULL, NULL);
+    pr_info("cam-raw-dump: step3 installing hooks\n");
+    p_hook_wrap3((void *)addr_get_io_buf, before_get_io_buf, after_get_io_buf, NULL);
+    p_hook_wrap2((void *)addr_vfe_out_done, before_vfe_out_done, NULL, NULL);
 
-    pr_info("cam-raw-dump: init ok\n");
+    pr_info("cam-raw-dump: step4 init ok\n");
     return 0;
 }
 
@@ -151,8 +164,10 @@ static long cam_kpm_control0(const char *args, char *__user out_msg, int outlen)
 
 static long cam_kpm_exit(void *reserved)
 {
-    if (addr_get_io_buf) unhook((void *)addr_get_io_buf);
-    if (addr_vfe_out_done) unhook((void *)addr_vfe_out_done);
+    if (p_unhook) {
+        if (addr_get_io_buf) p_unhook((void *)addr_get_io_buf);
+        if (addr_vfe_out_done) p_unhook((void *)addr_vfe_out_done);
+    }
     pr_info("cam-raw-dump exit\n");
     return 0;
 }
