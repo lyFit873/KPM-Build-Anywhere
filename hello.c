@@ -3,6 +3,7 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <kputils.h>
+#include <hook.h>
 
 KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.0.0");
@@ -16,7 +17,6 @@ KPM_DESCRIPTION("Camera RDI raw data extractor via VFE bus hook");
 #define CHUNK_SIZE (2 * 1024 * 1024)
 static unsigned char chunk_buf[CHUNK_SIZE];
 
-// ===== 所有跨模块调用的符号,统一走函数指针,避免 bl 指令重定位溢出 =====
 static void *(*p_filp_open)(const char *, int, unsigned short) = NULL;
 static long (*p_kernel_write)(void *, const void *, unsigned long, long long *) = NULL;
 static int (*p_filp_close)(void *, void *) = NULL;
@@ -56,10 +56,8 @@ static int is_err_ptr(void *ptr)
     return (unsigned long)ptr >= (unsigned long)-4095;
 }
 
-static volatile int capture_status = 0;  // 0=空闲 1=等待抓取 2=完成
+static volatile int capture_status = 0;
 
-// ===== Hook A: cam_mem_get_io_buf =====
-// TODO: 参数个数(3个)仍是假设,待对照 cam_mem_mgr.c 真实签名核实
 static void before_get_io_buf(hook_fargs3_t *args, void *udata)
 {
     args->local.data0 = args->arg0;
@@ -72,7 +70,6 @@ static void after_get_io_buf(hook_fargs3_t *args, void *udata)
         record_iova_mapping((uint32_t)(*iova_ptr), buf_handle);
 }
 
-// ===== Hook B: cam_vfe_bus_ver3_handle_vfe_out_done_bottom_half =====
 #define CAM_NUM_OUT_PER_COMP_IRQ_MAX 6
 struct cam_isp_hw_done_event_data {
     uint32_t num_handles;
@@ -155,9 +152,11 @@ static long cam_kpm_control0(const char *args, char *__user out_msg, int outlen)
         capture_status = 1;
         compat_copy_to_user(out_msg, "armed", 6);
     } else if (args[0] == 's') {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "status=%d", capture_status);
-        compat_copy_to_user(out_msg, buf, strlen(buf) + 1);
+        // 手动拼字符串,不用snprintf,避开隐式声明风险
+        char buf[16] = "status=";
+        buf[7] = '0' + (capture_status % 10);
+        buf[8] = '\0';
+        compat_copy_to_user(out_msg, buf, 9);
     }
     return 0;
 }
